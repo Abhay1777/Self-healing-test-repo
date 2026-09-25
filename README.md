@@ -159,8 +159,7 @@ OPENAI_API_KEY=your_key
 GITHUB_TOKEN=your_token
 ```
 
-> **Note:** Self-Heal Git is currently a hackathon/research prototype. Production deployment should include sandboxed code execution and additional security controls.
-
+>
 ## 👨‍💻 Author
 
 **Abhay Dubey**
