@@ -1,35 +1,30 @@
-﻿import sys
+﻿import os
+import sys
+import threading
+from datetime import datetime
 from pathlib import Path
 
-# Make backend/ available as a top-level module directory.
-# This allows existing imports such as:
-# from core.healing_engine import HealingEngine
-# from agents.test_agent import TestAgent
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
 
 ROOT = Path(__file__).resolve().parent.parent
-BACKEND_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = ROOT / "backend"
 
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
-
-
-from threading import Thread
-from datetime import datetime
-
-from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
-from core.git_manager import GitManager
-
+sys.path.insert(0, str(BACKEND_DIR))
 
 load_dotenv(ROOT / ".env")
 
 
+from core.git_manager import GitManager
+from core.healing_engine import HealingEngine
+
+
 app = FastAPI(
     title="Self-Heal Git",
-    version="2.0.0",
-    description="Autonomous AI-powered Git repository healing system"
+    version="1.0.0",
 )
 
 
@@ -37,11 +32,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "http://127.0.0.1:5173"
+        "http://127.0.0.1:5173",
     ],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
 
@@ -54,259 +49,290 @@ STATE = {
     "repository": None,
     "diff": "",
     "started_at": None,
-    "completed_at": None
+    "completed_at": None,
+    "committed": False,
+    "commit_sha": None,
 }
 
 
-git_manager = GitManager()
+class HealRequest(BaseModel):
+    repo_url: str
+    commit_to_github: bool = False
+    commit_message: str = (
+        "fix: automatically repair failing tests"
+    )
 
 
-def log(message, status="info", agent="SYSTEM"):
+def add_trace(message, status="info"):
+    STATE["trace"].append(
+        {
+            "message": message,
+            "status": status,
+            "timestamp": datetime.now().isoformat(),
+        }
+    )
 
-    STATE["trace"].append({
-        "agent": agent,
-        "message": message,
-        "status": status
-    })
 
-
-def run_repository_healing(repo_url):
+def run_repository_healing(
+    repo_url,
+    commit_to_github=False,
+    commit_message="fix: automatically repair failing tests",
+):
+    git_manager = GitManager()
 
     workspace = None
+    repo_path = None
+
+    STATE.update(
+        {
+            "running": True,
+            "success": None,
+            "attempts": 0,
+            "trace": [],
+            "error": None,
+            "repository": repo_url,
+            "diff": "",
+            "started_at": datetime.now().isoformat(),
+            "completed_at": None,
+            "committed": False,
+            "commit_sha": None,
+        }
+    )
 
     try:
-
-        from core.healing_engine import HealingEngine
-
-        STATE["running"] = True
-        STATE["success"] = None
-        STATE["attempts"] = 0
-        STATE["trace"] = []
-        STATE["error"] = None
-        STATE["diff"] = ""
-        STATE["repository"] = repo_url
-        STATE["started_at"] = datetime.now().isoformat()
-        STATE["completed_at"] = None
-
-        log(
-            "Cloning GitHub repository",
-            "info",
-            "GIT"
+        add_trace(
+            "Cloning GitHub repository"
         )
 
         repo_path, workspace = git_manager.clone(
             repo_url
         )
 
-        log(
+        add_trace(
             "Repository cloned successfully",
             "success",
-            "GIT"
         )
 
-        log(
-            f"Repository workspace created",
-            "info",
-            "GIT"
+        add_trace(
+            "Repository workspace created"
         )
 
-        log(
-            "Starting autonomous healing engine",
-            "info",
-            "SYSTEM"
+        add_trace(
+            "Starting autonomous healing engine"
         )
 
         engine = HealingEngine(
-            str(repo_path)
+            repo_path
+        )
+
+        add_trace(
+            "Starting autonomous healing pipeline"
         )
 
         result = engine.heal(
             max_attempts=3
         )
 
-        STATE["success"] = result["success"]
-        STATE["attempts"] = result["attempts"]
-
-        STATE["trace"].extend(
-            result["trace"]
+        STATE["attempts"] = result.get(
+            "attempts",
+            0,
         )
 
-        STATE["diff"] = git_manager.get_diff(
-            repo_path
-        )
+        for event in result.get(
+            "trace",
+            [],
+        ):
+            if isinstance(event, dict):
+                STATE["trace"].append(event)
+            else:
+                STATE["trace"].append(
+                    {
+                        "message": str(event),
+                        "status": "info",
+                    }
+                )
 
-        if STATE["success"]:
-
-            log(
-                "Git repository successfully healed",
-                "success",
-                "GIT"
+        STATE["diff"] = (
+            git_manager.get_diff(
+                repo_path
             )
+        )
 
-        else:
+        if not result.get("success"):
+            STATE["success"] = False
 
-            log(
-                "Repository could not be healed",
+            error = result.get(
                 "error",
-                "SYSTEM"
+                "Healing failed.",
             )
+
+            STATE["error"] = error
+
+            add_trace(
+                f"Healing failed: {error}",
+                "error",
+            )
+
+            return
+
+        # IMPORTANT:
+        # Only commit after verification succeeds.
+        if commit_to_github:
+
+            add_trace(
+                "Verification passed - preparing GitHub commit",
+                "success",
+            )
+
+            try:
+                commit_result = (
+                    git_manager.commit_and_push(
+                        repo_path,
+                        commit_message,
+                    )
+                )
+
+                if commit_result["committed"]:
+
+                    STATE["committed"] = True
+
+                    STATE["commit_sha"] = (
+                        commit_result["sha"]
+                    )
+
+                    add_trace(
+                        "Changes committed to GitHub",
+                        "success",
+                    )
+
+                    add_trace(
+                        "Commit SHA: "
+                        + commit_result["sha"],
+                        "success",
+                    )
+
+                    add_trace(
+                        "GitHub push completed successfully",
+                        "success",
+                    )
+
+                else:
+
+                    add_trace(
+                        commit_result["message"],
+                        "info",
+                    )
+
+            except Exception as commit_error:
+
+                STATE["success"] = False
+
+                STATE["error"] = (
+                    "Healing succeeded, but GitHub commit failed: "
+                    + str(commit_error)
+                )
+
+                add_trace(
+                    "GitHub commit failed: "
+                    + str(commit_error),
+                    "error",
+                )
+
+                return
+
+        add_trace(
+            "Git repository successfully healed",
+            "success",
+        )
+
+        STATE["success"] = True
 
     except Exception as error:
 
         STATE["success"] = False
         STATE["error"] = str(error)
 
-        log(
+        add_trace(
             str(error),
             "error",
-            "SYSTEM"
         )
 
     finally:
 
-        if workspace:
+        STATE["running"] = False
+        STATE["completed_at"] = (
+            datetime.now().isoformat()
+        )
 
+        if workspace:
             import shutil
 
             shutil.rmtree(
                 workspace,
-                ignore_errors=True
+                ignore_errors=True,
             )
-
-        STATE["running"] = False
-        STATE["completed_at"] = datetime.now().isoformat()
 
 
 @app.get("/")
 def root():
-
     return {
-        "application": "Self-Heal Git",
-        "version": "2.0.0",
-        "status": "online"
+        "name": "Self-Heal Git",
+        "status": "online",
     }
 
 
 @app.get("/health")
 def health():
-
     return {
-        "status": "healthy",
-        "git_integration": True
+        "status": "ok",
     }
 
 
 @app.get("/status")
 def status():
-
     return STATE
+
+
+@app.post("/heal-repository")
+def heal_repository(request: HealRequest):
+
+    if STATE["running"]:
+        raise HTTPException(
+            status_code=409,
+            detail="A healing operation is already running.",
+        )
+
+    if not request.repo_url.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Repository URL is required.",
+        )
+
+    thread = threading.Thread(
+        target=run_repository_healing,
+        args=(
+            request.repo_url.strip(),
+            request.commit_to_github,
+            request.commit_message.strip()
+            or "fix: automatically repair failing tests",
+        ),
+        daemon=True,
+    )
+
+    thread.start()
+
+    return {
+        "accepted": True,
+        "message": (
+            "Repository healing started."
+        ),
+        "repository": request.repo_url,
+        "commit_to_github": request.commit_to_github,
+    }
 
 
 @app.post("/heal-demo")
 def heal_demo():
-
-    if STATE["running"]:
-
-        return {
-            "accepted": False,
-            "message": "Healing is already running."
-        }
-
-    repo = ROOT / "test-repo"
-
-    from core.healing_engine import HealingEngine
-
-    STATE["running"] = True
-    STATE["success"] = None
-    STATE["attempts"] = 0
-    STATE["trace"] = []
-    STATE["error"] = None
-    STATE["diff"] = ""
-    STATE["repository"] = "Local Demo"
-    STATE["started_at"] = datetime.now().isoformat()
-    STATE["completed_at"] = None
-
-    def demo():
-
-        try:
-
-            engine = HealingEngine(
-                str(repo)
-            )
-
-            result = engine.heal(
-                max_attempts=3
-            )
-
-            STATE["success"] = result["success"]
-            STATE["attempts"] = result["attempts"]
-            STATE["trace"] = result["trace"]
-            STATE["diff"] = git_manager.get_diff(repo)
-
-        except Exception as error:
-
-            STATE["success"] = False
-            STATE["error"] = str(error)
-
-        finally:
-
-            STATE["running"] = False
-            STATE["completed_at"] = datetime.now().isoformat()
-
-    Thread(
-        target=demo,
-        daemon=True
-    ).start()
-
     return {
-        "accepted": True,
-        "message": "Demo healing started."
-    }
-
-
-@app.post("/heal-repository")
-def heal_repository(payload: dict):
-
-    if STATE["running"]:
-
-        return {
-            "accepted": False,
-            "message": "Healing is already running."
-        }
-
-    repo_url = payload.get(
-        "repo_url",
-        ""
-    ).strip()
-
-    if not repo_url:
-
-        return {
-            "accepted": False,
-            "message": "GitHub repository URL is required."
-        }
-
-    try:
-
-        git_manager.validate_url(
-            repo_url
-        )
-
-    except Exception as error:
-
-        return {
-            "accepted": False,
-            "message": str(error)
-        }
-
-    Thread(
-        target=run_repository_healing,
-        args=(repo_url,),
-        daemon=True
-    ).start()
-
-    return {
-        "accepted": True,
-        "message": "Repository healing started.",
-        "repository": repo_url
+        "message": "Use the frontend presentation demo."
     }
